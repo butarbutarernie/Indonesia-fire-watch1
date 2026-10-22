@@ -208,3 +208,61 @@ def assign_country_and_province(
     return pd.DataFrame(
         attributed.drop(columns=["geometry", "index_right", "__row_id"], errors="ignore")
     ).reset_index(drop=True)
+
+# v2: NASA API single-call maximum is five days. For seven days use 5 most
+# recent UTC dates and an older, explicit 2-day window; no overlapping dates.
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+def build_firms_url_dated(map_key: str, sensor: str, days: int, start_date=None) -> str:
+    base = build_firms_url(map_key, sensor, days)
+    if start_date is None:
+        return base
+    try:
+        from datetime import date
+        if isinstance(start_date, str):
+            start_date = date.fromisoformat(start_date)
+        if not isinstance(start_date, date):
+            raise ValueError("Invalid date")
+    except ValueError as exc:
+        raise ValueError("Tanggal awal harus berformat ISO YYYY-MM-DD.") from exc
+    return f"{base}/{start_date.isoformat()}"
+
+
+def fetch_recent_firms(map_key: str, sensor: str, days: int, today_utc=None) -> pd.DataFrame:
+    """Fetch 1,2,3,5,7 recent UTC calendar dates, not continuous rolling hours."""
+    if days not in (1, 2, 3, 5, 7):
+        raise ValueError("Periode FIRMS yang didukung: 1, 2, 3, 5, 7 hari.")
+    from datetime import date
+    current = today_utc or datetime.now(timezone.utc).date()
+    if isinstance(current, str):
+        current = date.fromisoformat(current)
+    if days <= 5:
+        # Date is explicit to make the window reproducible across midnight UTC.
+        start = current - timedelta(days=days - 1)
+        windows = [(days, start)]
+    else:
+        windows = [(2, current - timedelta(days=6)), (5, current - timedelta(days=4))]
+    chunks = []
+    for window_days, start in windows:
+        url = build_firms_url_dated(map_key, sensor, window_days, start)
+        try:
+            response = requests.get(
+                url, timeout=(12, 90),
+                headers={"User-Agent": "IndonesiaFireWatch/2.0 (Streamlit research dashboard)"},
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            # URL contains MAP_KEY, so NEVER include response URL/exception in UI/logs.
+            raise DataSourceError(
+                f"Gagal mengambil data FIRMS {sensor}; periksa API key dan status NASA."
+            ) from exc
+        chunks.append(parse_firms_csv(response.text, source=sensor))
+    if not chunks:
+        return pd.DataFrame()
+    out = pd.concat(chunks, ignore_index=True).drop_duplicates()
+    start_date = current - timedelta(days=days - 1)
+    return out.loc[
+        (out["acq_datetime_utc"].dt.date >= start_date)
+        & (out["acq_datetime_utc"].dt.date <= current)
+    ].reset_index(drop=True)

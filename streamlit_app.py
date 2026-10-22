@@ -1,4 +1,4 @@
-"""Indonesia Fire Watch 2.1 | automatic NAMOBJ village identification.
+"""Indonesia Fire Watch 2.2 | permanent national NPZ village identification.
 
 Only selected administrative polygons are loaded. Village boundaries are not
 inferred from nearest places; unknowns stay explicitly unidentified.
@@ -12,6 +12,7 @@ import json
 import math
 import os
 import hashlib
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -26,15 +27,23 @@ from village_upload import (
     VillageUploadError, load_named_villages, annotate_named_villages,
 )
 from national_namobj import (
-    NationalNamobjError, MATCH_STATUS, annotate_namobj_points, NamobjGeoParquetStore,
+    NationalNamobjError, MATCH_STATUS as GEOPARQUET_MATCH_STATUS,
+    annotate_namobj_points, NamobjGeoParquetStore,
+)
+from national_village_lookup import (
+    MATCH_STATUS as NPZ_MATCH_STATUS,
+    inspect_national_npz_assets, annotate_national_npz,
 )
 from firewatch_core import (
     DataSourceError, SENSORS, assign_country_and_province, fetch_boundary,
     fetch_recent_firms, geojson_to_gdf, parse_firms_csv,
 )
 
+BASE = Path(__file__).resolve().parent
+DATA_DIR = BASE / "data"
+
 st.set_page_config(
-    page_title="Indonesia Fire Watch v2.1 | National NAMOBJ",
+    page_title="Indonesia Fire Watch v2.2 | National NPZ NAMOBJ",
     page_icon="🔥", layout="wide", initial_sidebar_state="expanded",
 )
 
@@ -121,6 +130,13 @@ def cached_national_namobj(detections: pd.DataFrame, release_url: str):
     return annotate_namobj_points(detections, store)
 
 
+@st.cache_data(ttl=15 * 60, max_entries=3, show_spinner=False)
+def cached_national_npz(detections: pd.DataFrame, manifest_sha256: str):
+    # manifest_sha256 is part of the cache key, invalidating stale results
+    # when the local national lookup dataset is updated.
+    return annotate_national_npz(detections, DATA_DIR)
+
+
 def get_national_release_url() -> str:
     try:
         value = str(st.secrets.get("IFW_NAMOBJ_RELEASE_URL", "")).strip()
@@ -177,6 +193,11 @@ def display_map(df: pd.DataFrame, adm1: dict, geometry, name: str,
         "High": [220, 50, 46, 225], "Nominal": [252, 129, 44, 208],
         "Low": [248, 198, 58, 210], "Unknown": [105, 132, 161, 190],
     }
+    if "provinsi_namobj" in layer_data.columns:
+        # Use verified source province name for the popup; preserve original
+        # geoBoundaries province elsewhere for consistent aggregation.
+        prov_source = layer_data["provinsi_namobj"].fillna("").astype(str).str.strip()
+        layer_data["province"] = prov_source.where(prov_source.ne(""), layer_data["province"])
     layer_data = layer_data[[
         "latitude", "longitude", "acq_date", "acq_time", "province",
         "kabupaten_kota", "kecamatan", "desa", "confidence_class", "frp", "source",
@@ -267,7 +288,7 @@ def metric(label, value, note=""):
 
 st.markdown('''
 <div class="ifw-banner">
- <div class="tag">REMOTE SENSING · MONITORING NASIONAL · V2.1</div>
+ <div class="tag">REMOTE SENSING · MONITORING NASIONAL · V2.2</div>
  <div class="heading">🔥 Indonesia Fire Watch</div>
  <div class="desc">Pemantauan anomali termal satelit NASA FIRMS di seluruh Indonesia. Jelajahi
   tingkat provinsi, kabupaten/kota, kecamatan, hingga desa dengan analisis berbasis batas wilayah.
@@ -347,11 +368,30 @@ with st.sidebar:
             help="Mengunduh poligon desa pada kecamatan terpilih (maksimum 50 desa)."
         )
     st.divider()
-    national_url = get_national_release_url()
-    if national_url:
-        st.success("Sumber NAMOBJ nasional otomatis telah dikonfigurasi.")
+    national_url = get_national_release_url()  # Previous GeoParquet fallback only
+    npz_info = None
+    npz_error = None
+    try:
+        npz_info = inspect_national_npz_assets(DATA_DIR)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        npz_error = f"Manifest NPZ nasional tidak dapat dibaca ({type(exc).__name__})."
+    npz_ready = bool(npz_info and npz_info.get("configured") and not npz_info["missing"])
+    if npz_ready:
+        st.success(
+            f"NAMOBJ nasional siap: {npz_info['lookup_polygons']:,} poligon "
+            f"dalam {npz_info['found']:,} arsip NPZ lokal."
+        )
+    elif npz_info and npz_info.get("configured"):
+        st.warning(
+            f"NPZ nasional belum lengkap: {npz_info['found']:,}/"
+            f"{npz_info['expected']:,} arsip. Data desa otomatis belum dijalankan."
+        )
+    elif npz_error:
+        st.warning(npz_error)
+    elif national_url:
+        st.info("NPZ lokal belum terpasang; GeoParquet Release lama menjadi fallback.")
     else:
-        st.info("NAMOBJ nasional otomatis belum dihubungkan. Data FIRMS tetap berjalan; tambahkan IFW_NAMOBJ_RELEASE_URL di Secrets setelah aset siap.")
+        st.info("NAMOBJ otomatis belum aktif. Perlu folder data/ dengan 85 arsip NPZ dan manifest. NASA FIRMS tetap berjalan.")
     st.markdown("### 🗂️ Batas desa dari shapefile Anda")
     village_file = st.file_uploader(
         "Unggah ZIP Shapefile atau GeoJSON desa (NAMOBJ)",
@@ -494,24 +534,38 @@ if do_village_inventory and village_layer is None and regions["district"] and no
         except AdminDataError:
             st.warning("Referensi batas desa sedang gagal dimuat. Nama desa dibiarkan tidak teridentifikasi.")
 
-# National dataset uses the existing 28 Cell-5 GeoParquet shards and only NAMOBJ
-# for village labels. Uploads, if provided, remain an optional override.
+# National lookup takes the same WKB-in-NPZ approach as Kalimantan Fire Watch.
+# Only source geometry + NAMOBJ are used for village matching, never KDEPUM.
+# Preserve the older GeoParquet remote reader solely as an optional fallback.
 national_result = None
-if national_url and not selected.empty:
+national_lookup_source = None
+if not selected.empty and npz_ready:
     try:
-        with st.spinner("Mengidentifikasi desa otomatis dari NAMOBJ nasional ..."):
-            selected, national_result = cached_national_namobj(selected, national_url)
+        with st.spinner("Mencocokkan titik FIRMS dengan NPZ batas desa nasional ..."):
+            manifest_file = DATA_DIR / "national_village_manifest.json"
+            manifest_digest = hashlib.sha256(manifest_file.read_bytes()).hexdigest()
+            selected, national_result = cached_national_npz(selected, manifest_digest)
+            national_lookup_source = "NPZ nasional lokal"
         with st.sidebar:
             st.caption(
-                f"NAMOBJ nasional: {national_result['matched']:,} titik cocok, "
+                f"NAMOBJ NPZ: {national_result['matched']:,} cocok, "
                 f"{national_result['ambiguous']:,} ambigu, "
                 f"{national_result['unmatched']:,} belum teridentifikasi."
             )
+        if national_result.get("missing_assets", 0):
+            st.warning("Sebagian arsip desa tidak dapat dibaca; titik yang terdampak "
+                       "tidak diberi nama secara spekulatif.")
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        st.warning("Pembacaan NPZ nasional gagal. Data FIRMS tetap ditampilkan. "
+                   f"Lihat log Streamlit: {type(exc).__name__}.")
+elif not selected.empty and national_url:
+    try:
+        with st.spinner("Mengidentifikasi desa dari GeoParquet lama ..."):
+            selected, national_result = cached_national_namobj(selected, national_url)
+            national_lookup_source = "GeoParquet Release"
     except (NationalNamobjError, OSError, ValueError, KeyError) as exc:
-        st.warning(
-            "Basis NAMOBJ nasional belum dapat dibaca. Peta NASA tetap berjalan; "
-            f"periksa Release assets dan IFW_NAMOBJ_RELEASE_URL. Detail: {exc}"
-        )
+        st.warning("Basis GeoParquet nasional belum dapat dibaca. "
+                   f"Detail: {type(exc).__name__}.")
 
 # User-supplied NAMOBJ polygon lookup takes precedence over the optional online
 # village inventory. The selection is polygon-specific even if NAMOBJ repeats.
@@ -553,8 +607,16 @@ if village_layer is not None:
             geometry = uploaded_geometry
             area_name = row.namobj or "Nama desa kosong"
             area_code = str(row.kode_sumber) if row.kode_sumber else f"FILE-FEATURE-{chosen_id}"
-        selected, upload_result = annotate_named_villages(selected, candidates)
-        # Upload has explicit preference over Emsifa because the user supplied NAMOBJ.
+        partial, upload_result = annotate_named_villages(selected, candidates)
+        # Override only coordinates that actually intersect uploaded polygons.
+        # Other points retain labels previously obtained from national NPZ.
+        overlap = partial["desa_status"].isin([
+            "Cocok dengan poligon desa (NAMOBJ)",
+            "Ambigu (poligon tumpang tindih)",
+            "Poligon cocok, tetapi NAMOBJ kosong",
+        ])
+        for col in ("desa", "kode_desa", "desa_status"):
+            selected.loc[overlap, col] = partial.loc[overlap, col]
         village_result = None
     else:
         st.warning("Tidak ada poligon batas desa unggahan yang beririsan "
@@ -650,7 +712,7 @@ with tab_stats:
             st.markdown("#### Desa dengan deteksi (berdasarkan poligon)")
             matched_desa = selected.desa_status.isin([
                 "Cocok dengan poligon desa", "Cocok dengan poligon desa (NAMOBJ)",
-                MATCH_STATUS,
+                NPZ_MATCH_STATUS, GEOPARQUET_MATCH_STATUS,
             ])
             rank_source = selected.loc[matched_desa].copy()
             # Same NAMOBJ can exist in distinct districts. Keep its context
@@ -695,7 +757,8 @@ with tab_stats:
                 f"NAMOBJ nasional: **{national_result['matched']:,}** hotspot cocok; "
                 f"**{national_result['unmatched']:,}** tidak teridentifikasi; "
                 f"**{national_result['ambiguous']:,}** ambigu; "
-                f"**{national_result['used_shards']:,}** shard GeoParquet dimuat."
+                f"**{national_result['used_shards']:,}** arsip/shard terpakai. "
+                f"Sumber: **{national_lookup_source}**."
             )
     else:
         st.info("Tidak ada deteksi pada filter yang dipilih. Ini bukan bukti bahwa wilayah bebas kebakaran.")
@@ -722,7 +785,7 @@ with tab_data:
                                mime="application/geo+json", use_container_width=True)
         else:
             st.caption("Ekspor GeoJSON dinonaktifkan untuk >60.000 titik; gunakan CSV lengkap.")
-    st.caption("Nama desa diambil dari NAMOBJ nasional, layer NAMOBJ unggahan, "
+    st.caption("Nama desa diambil dari NPZ NAMOBJ nasional, layer unggahan, "
                "atau poligon pilihan saat tersedia. Titik tanpa kecocokan tidak ditebak.")
 
 with tab_notes:
@@ -735,10 +798,12 @@ with tab_notes:
 3. **Filter administrasi rinci:** pilihan provinsi/kabupaten/kota/kecamatan/desa
    diambil secara bertahap dari **Emsifa Wilayah Indonesia v2**. Setiap pilihan
    dipotong dengan geometri poligon aktual dari API, bukan centroid atau radius.
-   **NAMOBJ nasional:** bila URL GitHub Release dikonfigurasi, aplikasi membaca
-   GeoParquet 83.489 poligon hasil Cell 5 secara lazy dan mengambil nama desa
-   hanya dari `namobj` (asal `NAMOBJ`). KDEPUM tidak digunakan. Unggahan file
-   kecil opsional sebagai override.
+   **NAMOBJ nasional:** aplikasi mengutamakan 85 arsip NPZ lokal di folder
+   `data/`, hasil CELL 7 (83.489 poligon), dalam format yang sama dengan
+   Kalimantan Fire Watch. Pencocokan memakai STRtree dan nama desa dari
+   `NAMOBJ` (tersimpan sebagai `desa`), bukan KDEPUM. GeoParquet Release
+   lama hanya digunakan apabila NPZ lokal belum tersedia dan URL dikonfigurasi.
+   Unggahan file kecil tetap opsional sebagai override terbatas.
    Lookup pada data unggahan menggunakan spatial join; titik di batas/tumpang
    tindih dua poligon ditandai ambigu, nama kosong tidak ditebak.
 4. **Keterbatasan administratif:** batas detail Emsifa sudah disederhanakan,
@@ -756,7 +821,8 @@ with tab_notes:
         "Sumber batas nasional (ADM0)": country_meta,
         "Sumber provinsi (ADM1)": province_meta,
         "Emsifa v2": "https://www.emsifa.com/api-wilayah-indonesia/v2",
-        "NAMOBJ nasional otomatis": national_url or "Belum dikonfigurasi",
+        "NAMOBJ nasional otomatis": national_lookup_source or "Belum tersedia",
+        "NPZ lokal": (npz_info if npz_info and npz_info.get("configured") else "Belum tersedia"),
         "Poligon desa unggahan (jika ada)": village_meta or "Tidak diunggah",
         "Timestamp administrasi (jika tersedia)": [x for x in admin_stamps if x],
         "UTC request date": utc_day,
@@ -765,5 +831,5 @@ with tab_notes:
                "Confidence VIIRS adalah label kualitas deteksi, bukan peluang statistik "
                "bahwa sebuah desa mengalami kebakaran. Konfirmasi memerlukan sumber tambahan.")
 
-st.caption("© Indonesia Fire Watch v2.1 · NASA FIRMS · geoBoundaries (gbOpen) · "
+st.caption("© Indonesia Fire Watch v2.2 · NASA FIRMS · geoBoundaries (gbOpen) · "
            "Emsifa Wilayah Indonesia v2 | Prototype penelitian — bukan sistem peringatan resmi.")

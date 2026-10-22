@@ -1,0 +1,25 @@
+LANGKAH SELANJUTNYA — Indonesia Fire Watch v2.2 (ikuti Kalimantan)
+
+Hasil Cell 7 dari Anda sudah PASS: 83.489 poligon, 85 NPZ, 7,97 MiB maksimum.
+Tidak perlu audit KDEPUM atau konversi ulang.
+
+LANGKAH A (aman, tanpa publikasi data):
+1. Download IFW_CELL8_PRIVATE_NPZ_SMOKE_TEST.ipynb.
+2. Colab: File > Upload notebook; jalankan 3 cell kode.
+3. Kirim output "MATCH SUMMARY" dan nama desa sampel.
+
+LANGKAH B (kode sudah disiapkan):
+1. Unduh Indonesia_Fire_Watch_v2_2_NPZ_KFW_STYLE_CODE.zip.
+2. Repository Indonesia-fire-watch1: pilih branch v2.0-testing.
+3. Unggah kode hasil ekstraksi ke root repo; TIDAK termasuk 85 NPZ.
+4. Jangan paksa kode branch main menimpa testing.
+
+LANGKAH C (sumber data pada Streamlit):
+- Paket KODE SAJA belum bisa menampilkan nama desa otomatis di Cloud.
+- NPZ harus tersedia di folder data/ dalam runtime Streamlit.
+- Jika hak redistribusi BIG sudah diverifikasi, pemasangan folder data/ pada
+  repo hosting sesuai Kalimantan adalah cara paling sederhana.
+- Jika izin belum jelas, jangan unggah NPZ ke repo atau Release publik;
+  gunakan penyimpanan privat yang autentikasinya terkelola dan adaptasi downloader.
+
+Data BIG tidak ikut didistribusikan dalam ZIP kode ini.
